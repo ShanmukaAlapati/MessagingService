@@ -12,7 +12,7 @@ from psycopg2.extras import RealDictCursor
 # Config
 # -------------------------------------------------------------------
 
-DATABASE_URL = os.getenv("DATABASE_URL")  # set in Render
+DATABASE_URL = os.getenv("DATABASE_URL")  # set in Render/local env
 if not DATABASE_URL:
     raise RuntimeError("DATABASE_URL env var is required")
 
@@ -20,7 +20,10 @@ app = Flask(__name__)
 app.config['SECRET_KEY'] = os.getenv("SECRET_KEY", "simple-chat-key-change-in-prod")
 
 CORS(app)
-socketio = SocketIO(app, cors_allowed_origins="*", async_mode='eventlet')  # for Render/gunicorn
+socketio = SocketIO(app, cors_allowed_origins="*", async_mode='eventlet')
+
+# Track if we've run init_db() at least once in this process
+_db_initialized = False
 
 
 # -------------------------------------------------------------------
@@ -49,6 +52,7 @@ def close_db(exc):
 def init_db():
     """
     Ensure tables exist in Postgres: users, conversations, messages.
+    Safe to run multiple times (uses IF NOT EXISTS).
     """
     conn = psycopg2.connect(DATABASE_URL)
     cur = conn.cursor()
@@ -89,6 +93,18 @@ def init_db():
     conn.close()
 
 
+@app.before_request
+def ensure_db_initialized():
+    """
+    Run init_db() once in this process before handling the first request.
+    This ensures tables exist before any SELECT/INSERT.
+    """
+    global _db_initialized
+    if not _db_initialized:
+        init_db()
+        _db_initialized = True
+
+
 def normalize_pair(a: str, b: str):
     """
     Normalize pair order so (a,b) == (b,a).
@@ -101,6 +117,38 @@ def conv_room(conv_id: int) -> str:
     Build Socket.IO room name from conversation id.
     """
     return f"conv_{conv_id}"
+
+
+# -------------------------------------------------------------------
+# REST: seed users (optional)
+# -------------------------------------------------------------------
+
+@app.route("/seed-users", methods=["POST"])
+def seed_users():
+    """
+    Seed demo users into the users table.
+    Body: {"users": [{"id": "sai@example.com", "name": "Sai"}, ...]}
+    """
+    data = request.get_json(force=True, silent=True) or {}
+    users = data.get("users") or []
+    if not users:
+        return jsonify({"status": "no_users_given"}), 400
+
+    db = get_db()
+    cur = db.cursor()
+    for u in users:
+        uid = u.get("id")
+        name = u.get("name") or uid
+        if not uid:
+            continue
+        cur.execute(
+            "INSERT INTO users (id, name) VALUES (%s, %s) ON CONFLICT (id) DO NOTHING;",
+            (uid, name),
+        )
+
+    db.commit()
+    cur.close()
+    return jsonify({"status": "ok", "count": len(users)})
 
 
 # -------------------------------------------------------------------
@@ -130,6 +178,7 @@ def get_or_create_direct_conversation():
     """
     Get or create a 1-to-1 conversation between me and other.
     Query params: ?me=<user_id>&other=<user_id>
+    If users don't exist, you can choose to auto-insert them here.
     """
     current_user = request.args.get("me")
     other_user = request.args.get("other")
@@ -141,6 +190,13 @@ def get_or_create_direct_conversation():
     db = get_db()
     cur = db.cursor()
 
+    # OPTIONAL: auto-insert users if they don't exist (current simple approach)
+    # This lets you start using the system from first message without manual seeding.
+    cur.execute("INSERT INTO users (id, name) VALUES (%s, %s) ON CONFLICT (id) DO NOTHING;", (u1, u1))
+    cur.execute("INSERT INTO users (id, name) VALUES (%s, %s) ON CONFLICT (id) DO NOTHING;", (u2, u2))
+    db.commit()
+
+    # Find existing conversation
     cur.execute(
         "SELECT id FROM conversations WHERE user1_id=%s AND user2_id=%s;",
         (u1, u2),
@@ -255,6 +311,13 @@ def handle_send_message(data):
 
     db = get_db()
     cur = db.cursor()
+
+    # OPTIONAL: ensure sender exists in users table
+    cur.execute(
+        "INSERT INTO users (id, name) VALUES (%s, %s) ON CONFLICT (id) DO NOTHING;",
+        (sender, sender),
+    )
+
     cur.execute(
         """
         INSERT INTO messages (conversation_id, sender_id, text)
@@ -291,7 +354,7 @@ def handle_send_message(data):
 @app.route("/chat")
 def chat_ui():
     """
-    Serve the chat interface HTML.
+    Serve the chat interface HTML from ./static/chat.html.
     """
     return send_from_directory(".", "chat.html")
 
@@ -302,7 +365,7 @@ def health():
 
 
 # -------------------------------------------------------------------
-# Entry point (local)
+# Entry point (local dev)
 # -------------------------------------------------------------------
 
 if __name__ == "__main__":
