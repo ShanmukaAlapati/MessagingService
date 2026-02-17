@@ -3,3 +3,4 @@ flask-socketio
 flask-cors
 eventlet
 psycopg2-binary
+gunicorn
